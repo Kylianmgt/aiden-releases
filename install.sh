@@ -271,6 +271,99 @@ log "Extracting into $AIDEN_HOME"
 find "$AIDEN_HOME" -mindepth 1 -maxdepth 1 ! -name 'data' -exec rm -rf {} +
 tar -xzf "$TAR_FILE" -C "$AIDEN_HOME"
 mkdir -p "$AIDEN_HOME/data" "$AIDEN_HOME/data/mobile-bridge"
+
+# Inject an `electron` stub package into node_modules. Several main-process
+# modules in the runtime (database → default-agents → agent-workspace,
+# license, widget-runtime) do a top-level `import { app, BrowserWindow,
+# ipcMain } from 'electron'`. In headless mode none of the Electron-only
+# methods get CALLED — but the import resolution itself fails at boot with
+# MODULE_NOT_FOUND because electron isn't a prod dep. The stub satisfies
+# the require and throws a loud error only if something tries to USE a
+# desktop-only API (telling us exactly where to refactor through HostEnv).
+log "Installing electron stub for headless require resolution"
+STUB_DIR="$AIDEN_HOME/node_modules/electron"
+mkdir -p "$STUB_DIR"
+cat > "$STUB_DIR/package.json" <<'STUBJSON'
+{"name":"electron","version":"0.0.0-headless","main":"index.js"}
+STUBJSON
+cat > "$STUB_DIR/index.js" <<'STUBJS'
+// Headless stub for the AIDEN web server. Anything Electron-specific that
+// actually gets CALLED here is a bug — refactor the call site through
+// services/mobile-bridge/host-env.ts so it works in both modes.
+const noop = () => undefined;
+const headlessGuard = (name) => () => {
+  throw new Error(`[electron-stub] '${name}' called in headless web mode. ` +
+    `If you see this, refactor the call site to route through HostEnv ` +
+    `(electron/main/services/mobile-bridge/host-env.ts) or otherwise guard ` +
+    `against Electron-only APIs.`);
+};
+
+class HeadlessBrowserWindow {
+  static getAllWindows() { return []; }
+  constructor() { throw new Error('[electron-stub] new BrowserWindow() in headless mode'); }
+}
+class HeadlessNotification {
+  constructor() {}
+  show() {}
+  on() {}
+}
+
+module.exports = {
+  app: {
+    isPackaged: false,
+    getVersion: () => process.env.npm_package_version || 'server-mode',
+    getPath: headlessGuard('app.getPath'),
+    getAppPath: () => process.cwd(),
+    on: noop,
+    once: noop,
+    off: noop,
+    removeAllListeners: noop,
+    whenReady: () => Promise.resolve(),
+    quit: noop,
+    exit: noop,
+    setLoginItemSettings: noop,
+    commandLine: { appendSwitch: noop, appendArgument: noop },
+  },
+  BrowserWindow: HeadlessBrowserWindow,
+  ipcMain: {
+    handle: noop, handleOnce: noop, on: noop, once: noop, off: noop,
+    removeAllListeners: noop, removeHandler: noop,
+  },
+  ipcRenderer: { on: noop, send: noop, invoke: () => Promise.resolve(null) },
+  Notification: HeadlessNotification,
+  shell: {
+    openExternal: () => Promise.resolve(),
+    showItemInFolder: noop,
+    openPath: () => Promise.resolve(''),
+  },
+  dialog: {
+    showOpenDialog: () => Promise.resolve({ canceled: true, filePaths: [] }),
+    showSaveDialog: () => Promise.resolve({ canceled: true }),
+    showMessageBox: () => Promise.resolve({ response: 0 }),
+  },
+  Menu: { setApplicationMenu: noop, buildFromTemplate: () => ({ popup: noop }) },
+  MenuItem: class {},
+  Tray: class { constructor() { throw new Error('[electron-stub] new Tray() in headless mode') } },
+  nativeImage: {
+    createEmpty: () => ({}),
+    createFromPath: () => ({}),
+    createFromDataURL: () => ({}),
+  },
+  protocol: {
+    handle: noop, registerSchemesAsPrivileged: noop, registerFileProtocol: noop,
+  },
+  session: {
+    defaultSession: { webRequest: { onBeforeRequest: noop, onHeadersReceived: noop } },
+  },
+  systemPreferences: { getMediaAccessStatus: () => 'granted' },
+  powerMonitor: { on: noop, addListener: noop },
+  autoUpdater: { on: noop, checkForUpdates: noop },
+  screen: { getPrimaryDisplay: () => ({ workAreaSize: { width: 1440, height: 900 } }), on: noop },
+  globalShortcut: { register: noop, unregister: noop, unregisterAll: noop },
+  clipboard: { readText: () => '', writeText: noop },
+};
+STUBJS
+
 chown -R "$SERVICE_USER:$SERVICE_USER" "$AIDEN_HOME"
 
 # Install the AI provider CLIs globally so the AIDEN runtime can spawn
