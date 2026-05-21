@@ -379,12 +379,54 @@ if ! npm list -g --depth=0 2>/dev/null | grep -qE '@openai/codex'; then
 fi
 
 # ─── Public URL + bridge config ─────────────────────────────────────────────
+#
+# PUBLIC_URL is what gets baked into the SPA + the pairing QR. Three modes:
+#   1. --domain + Caddy in front  → https://<domain>
+#   2. --domain + own proxy        → https://<domain>
+#   3. no --domain                 → http://<auto-detected-public-ip>:$WEB_PORT
+#
+# PUBLIC_HOST is the host iOS should dial for /v1/* (the bridge). Same
+# auto-detection so the user just gets a working QR after `install.sh`
+# without setting AIDEN_BRIDGE_PUBLIC_HOST by hand.
 
-PUBLIC_URL="http://localhost:$WEB_PORT"
+# Auto-detect the host's public IPv4 via a couple of cheap services so
+# this works on most VPS providers without operator config. Falls back
+# to whatever ip route says.
+detect_public_ip() {
+  for url in \
+    "https://ifconfig.me/ip" \
+    "https://api.ipify.org" \
+    "https://checkip.amazonaws.com"; do
+    ip=$(curl -fsS --max-time 4 "$url" 2>/dev/null | tr -d '\n[:space:]')
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$ip"; return 0
+    fi
+  done
+  # Fallback: the default-route source IP.
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1
+}
+
+DETECTED_IP=$(detect_public_ip)
+[[ -n "$DETECTED_IP" ]] && log "Detected public IP: $DETECTED_IP"
+
+PUBLIC_URL="http://${DETECTED_IP:-localhost}:$WEB_PORT"
+PUBLIC_HOST="${DETECTED_IP:-localhost}"
 if [[ "$USE_CADDY" == "yes" && -n "$DOMAIN" ]]; then
   PUBLIC_URL="https://$DOMAIN"
-elif [[ "$USE_CADDY" == "no" && -n "$DOMAIN" ]]; then
+  PUBLIC_HOST="$DOMAIN"
+elif [[ -n "$DOMAIN" ]]; then
+  # User has their own proxy/domain — assume https in front.
   PUBLIC_URL="https://$DOMAIN"
+  PUBLIC_HOST="$DOMAIN"
+fi
+log "PUBLIC_URL=$PUBLIC_URL  PUBLIC_HOST=$PUBLIC_HOST  BRIDGE_PORT=$BRIDGE_PORT"
+
+# Best-effort firewall: open the web + bridge ports in ufw if it's the
+# active firewall. Silent no-op otherwise (iptables direct, firewalld,
+# cloud security groups — all out of scope; document required ports).
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "^Status: active"; then
+  ufw allow "$WEB_PORT/tcp" >/dev/null 2>&1 && ok "ufw: opened tcp/$WEB_PORT" || true
+  ufw allow "$BRIDGE_PORT/tcp" >/dev/null 2>&1 && ok "ufw: opened tcp/$BRIDGE_PORT" || true
 fi
 
 # ─── systemd unit ───────────────────────────────────────────────────────────
@@ -404,16 +446,33 @@ Group=$SERVICE_USER
 WorkingDirectory=$AIDEN_HOME
 ExecStart=/usr/bin/node $AIDEN_HOME/dist-web/web/server.js
 
-# Loopback bind when Caddy is in front; public bind otherwise.
 Environment=NODE_ENV=production
 Environment=PORT=$WEB_PORT
 Environment=AIDEN_BRIDGE_PORT=$BRIDGE_PORT
-Environment=AIDEN_BRIDGE_BIND=loopback
+# Bridge binds publicly so iOS can reach it from outside the host.
+# self-signed TLS + SPKI pin (via the QR fingerprint) make this safe.
+Environment=AIDEN_BRIDGE_BIND=all
+Environment=AIDEN_BRIDGE_DIRECT_TLS=1
 Environment=AIDEN_BRIDGE_STATE_DIR=$AIDEN_HOME/data/mobile-bridge
+# Public host + port for the QR. Defaults to the VPS's public IP +
+# the bridge port; the operator can still override via env.
+Environment=AIDEN_BRIDGE_PUBLIC_HOST=$PUBLIC_HOST
+Environment=AIDEN_BRIDGE_PUBLIC_PORT=$BRIDGE_PORT
 Environment=AIDEN_PUBLIC_URL=$PUBLIC_URL
-Environment=AIDEN_BRIDGE_PIN_MODE=$PIN_MODE
+Environment=AIDEN_BRIDGE_PIN_MODE=spki
 Environment=AIDEN_DB_PATH=$AIDEN_HOME/data/aiden-local.db
 Environment=HOME=$AIDEN_HOME
+
+# GitHub OAuth (server mode). The default GITHUB_CLIENT_ID is shipped with
+# the build but the redirect URI has to be the operator's PUBLIC URL so the
+# GitHub OAuth App roundtrip lands back here. If the GitHub OAuth App is
+# not configured with this exact URL in its 'Authorization callback URL'
+# field, GitHub will reject the auth with 'redirect_uri mismatch'.
+#
+# To use: register a GitHub OAuth App at https://github.com/settings/developers
+# with the callback URL = https://your-domain/api/auth/github/callback,
+# then set GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET below or via override.
+Environment=GITHUB_OAUTH_REDIRECT_URI=$PUBLIC_URL/api/auth/github/callback
 
 # Hardening
 NoNewPrivileges=true
