@@ -240,6 +240,7 @@ auth: none
 disable-telemetry: true
 disable-update-check: true
 cert: false
+trusted-origins: ["*"]
 EOF
   chown -R "$SERVICE_USER:$SERVICE_USER" "$AIDEN_HOME/.config"
   ok "code-server configured at 127.0.0.1:8081 (no auth — gated by AIDEN session)"
